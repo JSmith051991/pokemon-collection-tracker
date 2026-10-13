@@ -68,6 +68,15 @@ const SCHEMA_VERSION = 1.0;
 const CHANGELOG = [
   {
     date: '2026-10-13',
+    type: 'improvement',
+    summary: 'Market price refresh now requires a TCGplayer product ID by default, with a Settings toggle to allow the old name-search fallback',
+    details: [
+      'The name+set search fallback for an item with no saved TCGplayer ID cost 5 credits per click (vs. 1 for an ID-based lookup) against the free tier\'s 100/day limit, and could occasionally match the wrong product with a similar name. "🔄" now requires a TCGplayer product ID by default — it\'s disabled with a hint on Items, Market Prices, and the Stale Market Prices queue until one is added.',
+      'New "Require TCGplayer product ID for price refresh" toggle in Settings → System → Integrations — turn it off to restore the name-search fallback for items you\'d rather not look up an ID for, at the cost of burning through the daily quota faster.',
+    ],
+  },
+  {
+    date: '2026-10-13',
     type: 'feature',
     summary: 'Added one-click market price updates from PokemonPriceTracker — everywhere a sealed item\'s price is tracked',
     details: [
@@ -4198,10 +4207,23 @@ async function pptLookupSealedByTcgId(db, apiKey, tcgplayerProductId) {
   }
 }
 
+// Whether a market-price refresh is allowed to fall back to a name+set
+// search when an item has no saved TCGplayer product ID. Settings →
+// System → Integrations → "Require TCGplayer ID for price refresh"
+// toggle. Defaults ON (require an ID) — a name search is billed per
+// result requested (5 credits a click against a 100/day free quota) and
+// can mismatch on a near-duplicate product name, where a tcgPlayerId
+// lookup is both a precise single-item match (1 credit) and immune to
+// name collisions.
+function pptRequiresTcgId(db) {
+  return db.settings?.pptRequireTcgIdForRefresh !== false;
+}
+
 // One-click market price refresh for an item/inventory product: prefers
-// the saved TCGplayer product ID (precise), falls back to a name+set
-// search and takes the closest name match — flagging the result as a
-// "best guess" when the matched name isn't an exact match, so a refresh
+// the saved TCGplayer product ID (precise, 1 credit). Falls back to a
+// name+set search ONLY when "Require TCGplayer ID" is turned off in
+// Settings → System → Integrations — taking the closest name match and
+// flagging the result as a "best guess" when it isn't exact, so a refresh
 // never silently substitutes the wrong product's price. Returns { price,
 // image, tcgplayerProductId, matchedName, approximate, error }, never
 // throws.
@@ -4212,6 +4234,9 @@ async function pptRefreshItemMarketPrice(db, apiKey, item, setNameForItem) {
     if (error) return { error };
     if (!product || product.market == null) return { error: 'No current price available for this product.' };
     return { price: product.market, image: product.image, tcgplayerProductId: product.tcgplayerProductId, matchedName: product.name, approximate: false };
+  }
+  if (pptRequiresTcgId(db)) {
+    return { error: 'Add a TCGplayer product ID to this item first, then refresh. (Turn off "Require TCGplayer ID" in Settings → System → Integrations to allow a name search instead.)' };
   }
   const query = setNameForItem ? `${item.name} ${setNameForItem}` : item.name;
   const { results, error } = await pptSearchSealedProducts(db, apiKey, query, 5);
@@ -8410,15 +8435,22 @@ function ItemsSection({ db, update, initialFocus }) {
                         const bundleActive = (form.bundleOf || []).filter((b) => b.itemId && b.qty > 0).length > 0 && form.bundleAutoValue !== false;
                         const varietyActive = !bundleActive && (form.possibleOutcomeIds || []).length > 0 && !!form.varietyAutoValue;
                         if (bundleActive || varietyActive) return null; // value is computed, not refreshable
+                        const needsId = pptRequiresTcgId(db) && !form.tcgplayerProductId;
+                        const btnDisabled = priceRefreshing || !pptApiKey || needsId;
+                        const btnTitle = !pptApiKey
+                          ? 'Add a PokemonPriceTracker API key in Settings → System → Integrations first'
+                          : needsId
+                          ? 'Add a TCGplayer product ID above first (or turn off "Require TCGplayer ID" in Settings → System → Integrations)'
+                          : 'Pull the current market price from PokemonPriceTracker';
                         return (
                           <button
                             onClick={refreshItemPriceFromApi}
-                            disabled={priceRefreshing || !pptApiKey}
-                            title={pptApiKey ? 'Pull the current market price from PokemonPriceTracker' : 'Add a PokemonPriceTracker API key in Settings → System → Integrations first'}
+                            disabled={btnDisabled}
+                            title={btnTitle}
                             style={{
                               background: '#13233f', border: '1px solid #2a4570', borderRadius: 6,
-                              cursor: pptApiKey && !priceRefreshing ? 'pointer' : 'not-allowed', padding: '4px 9px', fontSize: 11,
-                              color: '#9db8dd', opacity: !pptApiKey || priceRefreshing ? 0.55 : 1,
+                              cursor: btnDisabled ? 'not-allowed' : 'pointer', padding: '4px 9px', fontSize: 11,
+                              color: '#9db8dd', opacity: btnDisabled ? 0.55 : 1,
                             }}
                           >
                             {priceRefreshing ? 'Looking up…' : '🔄 Update from PokemonPriceTracker'}
@@ -22006,7 +22038,7 @@ function StatsSection({ db, initialFocus, onNavigate }) {
 // in, with Save & Next / Skip / Done buttons and a progress count. Used by
 // both the missing-TCGplayer-ID tool and the stale-market-price tool below
 // rather than building two near-identical modals from scratch.
-function ItemReviewQueueModal({ db, items, title, accent, fieldLabel, fieldHint, getInitialValue, renderInput, onSaveItem, onClose, doneMessage, secondaryActionLabel, onSecondaryAction, onApiRefresh }) {
+function ItemReviewQueueModal({ db, items, title, accent, fieldLabel, fieldHint, getInitialValue, renderInput, onSaveItem, onClose, doneMessage, secondaryActionLabel, onSecondaryAction, onApiRefresh, apiRefreshDisabledHint }) {
   const [index, setIndex] = useState(0);
   const [value, setValue] = useState(() => getInitialValue(items[0]));
   const [savedCount, setSavedCount] = useState(0);
@@ -22108,23 +22140,31 @@ function ItemReviewQueueModal({ db, items, title, accent, fieldLabel, fieldHint,
           <Field label={fieldLabel}>
             {renderInput(value, setValue, current)}
           </Field>
-          {onApiRefresh && (
-            <div style={{ marginTop: 8 }}>
-              <button
-                onClick={handleApiRefresh}
-                disabled={refreshing}
-                style={{
-                  background: '#13233f', border: '1px solid #2a4570', borderRadius: 6, cursor: refreshing ? 'default' : 'pointer',
-                  padding: '5px 10px', fontSize: 11.5, color: '#9db8dd', opacity: refreshing ? 0.6 : 1,
-                }}
-              >
-                {refreshing ? 'Looking up…' : '🔄 Fill from PokemonPriceTracker'}
-              </button>
-              {refreshMsg && (
-                <div style={{ fontSize: 10.5, marginTop: 5, color: refreshMsg.ok ? '#5ee8a8' : '#ff9a9a', lineHeight: 1.4 }}>{refreshMsg.text}</div>
-              )}
-            </div>
-          )}
+          {onApiRefresh && (() => {
+            const disabledHint = apiRefreshDisabledHint ? apiRefreshDisabledHint(current) : '';
+            const isDisabled = refreshing || !!disabledHint;
+            return (
+              <div style={{ marginTop: 8 }}>
+                <button
+                  onClick={handleApiRefresh}
+                  disabled={isDisabled}
+                  title={disabledHint || undefined}
+                  style={{
+                    background: '#13233f', border: '1px solid #2a4570', borderRadius: 6, cursor: isDisabled ? 'not-allowed' : 'pointer',
+                    padding: '5px 10px', fontSize: 11.5, color: '#9db8dd', opacity: isDisabled ? 0.55 : 1,
+                  }}
+                >
+                  {refreshing ? 'Looking up…' : '🔄 Fill from PokemonPriceTracker'}
+                </button>
+                {disabledHint && !refreshing && (
+                  <div style={{ fontSize: 10.5, marginTop: 5, color: '#5a7bb0', lineHeight: 1.4 }}>{disabledHint}</div>
+                )}
+                {refreshMsg && (
+                  <div style={{ fontSize: 10.5, marginTop: 5, color: refreshMsg.ok ? '#5ee8a8' : '#ff9a9a', lineHeight: 1.4 }}>{refreshMsg.text}</div>
+                )}
+              </div>
+            );
+          })()}
           {fieldHint && <div style={{ fontSize: 10.5, color: '#5a7bb0', marginTop: 4, lineHeight: 1.4 }}>{fieldHint}</div>}
         </div>
 
@@ -22182,6 +22222,12 @@ function ToolsSection({ db, update }) {
   const refreshStalePriceFromApi = (item) => {
     const setNm = db.sets.find((s) => s.id === item.setId)?.name || '';
     return pptRefreshItemMarketPrice(db, pptApiKey, item, setNm);
+  };
+  const stalePriceRefreshHint = (item) => {
+    if (item && pptRequiresTcgId(db) && !item.tcgplayerProductId) {
+      return 'Add a TCGplayer product ID to this item first (or turn off "Require TCGplayer ID" in Settings → System → Integrations).';
+    }
+    return '';
   };
 
   return (
@@ -22310,6 +22356,7 @@ function ToolsSection({ db, update }) {
           onClose={() => setActiveTool(null)}
           doneMessage={(n) => `Updated the market price on ${n} item${n !== 1 ? 's' : ''}.`}
           onApiRefresh={pptApiKey ? refreshStalePriceFromApi : null}
+          apiRefreshDisabledHint={stalePriceRefreshHint}
         />
       )}
 
@@ -24634,18 +24681,29 @@ function SettingsSection({ db, update, initialFocus }) {
                       📈
                     </button>
                     <div style={{ fontSize: 11, color: '#5a7bb0', minWidth: 90 }}>Current: {money(it.marketValue)}</div>
-                    <button
-                      onClick={() => refreshRowPriceFromApi(it)}
-                      disabled={!pptApiKey || !!refreshingPriceIds[it.id]}
-                      title={pptApiKey ? 'Pull current price from PokemonPriceTracker' : 'Add a PokemonPriceTracker API key in Settings → System → Integrations first'}
-                      style={{
-                        background: 'transparent', border: '1px solid #1e3a5f', borderRadius: 6,
-                        cursor: pptApiKey ? 'pointer' : 'not-allowed', padding: '4px 7px', fontSize: 13, flexShrink: 0, lineHeight: 1,
-                        opacity: !pptApiKey || refreshingPriceIds[it.id] ? 0.5 : 1,
-                      }}
-                    >
-                      {refreshingPriceIds[it.id] ? '⏳' : '🔄'}
-                    </button>
+                    {(() => {
+                      const needsId = pptRequiresTcgId(db) && !it.tcgplayerProductId;
+                      const rowDisabled = !pptApiKey || needsId || !!refreshingPriceIds[it.id];
+                      const rowTitle = !pptApiKey
+                        ? 'Add a PokemonPriceTracker API key in Settings → System → Integrations first'
+                        : needsId
+                        ? 'Add a TCGplayer product ID to this item first (or turn off "Require TCGplayer ID" in Settings → System → Integrations)'
+                        : 'Pull current price from PokemonPriceTracker';
+                      return (
+                        <button
+                          onClick={() => refreshRowPriceFromApi(it)}
+                          disabled={rowDisabled}
+                          title={rowTitle}
+                          style={{
+                            background: 'transparent', border: '1px solid #1e3a5f', borderRadius: 6,
+                            cursor: rowDisabled ? 'not-allowed' : 'pointer', padding: '4px 7px', fontSize: 13, flexShrink: 0, lineHeight: 1,
+                            opacity: rowDisabled ? 0.5 : 1,
+                          }}
+                        >
+                          {refreshingPriceIds[it.id] ? '⏳' : '🔄'}
+                        </button>
+                      );
+                    })()}
                     <CurrencyInput
                       placeholder="New price"
                       value={priceEdits[it.id] ?? ''}
@@ -25243,6 +25301,25 @@ function SettingsSection({ db, update, initialFocus }) {
                 {db.settings?.pokemonPriceTrackerApiKey && !hasProxy && (
                   <div style={{ color: '#ffd27a', fontSize: 11.5, marginTop: 6 }}>Key saved, but lookups will fail with a CORS error until a proxy URL is set above.</div>
                 )}
+
+                <div style={{ fontSize: 13, color: '#e6f0ff', fontWeight: 700, marginTop: 20, marginBottom: 4 }}>Sealed product price refresh</div>
+                <div style={{ fontSize: 11.5, color: '#5a7bb0', marginBottom: 10, lineHeight: 1.6 }}>
+                  Controls the "🔄" refresh button on Items, Market Prices, and the Stale Market Prices queue.
+                </div>
+                <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={pptRequiresTcgId(db)}
+                    onChange={(e) => update({ ...db, settings: { ...db.settings, pptRequireTcgIdForRefresh: e.target.checked } })}
+                    style={{ marginTop: 2 }}
+                  />
+                  <span style={{ fontSize: 12, color: '#e6f0ff' }}>
+                    Require a TCGplayer product ID for price refresh
+                    <div style={{ fontSize: 11, color: '#5a7bb0', marginTop: 2, lineHeight: 1.6, fontWeight: 400 }}>
+                      On (recommended): refresh only works once an item has a saved TCGplayer product ID — a precise, 1-credit lookup. Off: an item with no ID falls back to a name search instead (5 credits per click, and can occasionally match the wrong product with a similar name) — useful if you'd rather not look up IDs by hand, at the cost of burning through the 100/day free quota faster.
+                    </div>
+                  </span>
+                </label>
               </>
             );
           })()}
